@@ -19,6 +19,7 @@ export interface FeedbackData {
   performanceId: string;
   aiTranscription?: string;
   aiSummary?: string;
+  isSynced?: boolean; // New field to track cloud status
 }
 
 export interface EmotionOption {

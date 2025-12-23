@@ -1,15 +1,17 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Step, FeedbackData } from './types';
-import { PERFORMANCE_ID, EMOTIONS, CAREERS } from './constants';
+import { PERFORMANCE_ID, EMOTIONS, CAREERS, SYNC_ENDPOINT } from './constants';
 import { Layout } from './components/Layout';
 import { processVoiceFeedback } from './services/geminiService';
+import { pushToCloud, pullFromCloud } from './services/syncService';
 
 const STORAGE_KEY = 'senior_music_feedback_data';
 
 const App: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<Step>(Step.LANDING);
   const [allFeedback, setAllFeedback] = useState<FeedbackData[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [data, setData] = useState<FeedbackData>({
     id: Math.random().toString(36).substr(2, 9),
     timestamp: Date.now(),
@@ -18,6 +20,7 @@ const App: React.FC = () => {
     voiceAudioBase64: null,
     career: null,
     performanceId: PERFORMANCE_ID,
+    isSynced: false
   });
 
   const [isRecording, setIsRecording] = useState(false);
@@ -28,6 +31,7 @@ const App: React.FC = () => {
   
   const tapRef = useRef({ count: 0, last: 0 });
 
+  // Load local data on boot
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
@@ -39,9 +43,43 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // Persist local data whenever it changes
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(allFeedback));
   }, [allFeedback]);
+
+  // Background Sync Engine: Try to sync unsynced records
+  useEffect(() => {
+    if (!SYNC_ENDPOINT) return;
+
+    const syncInterval = setInterval(async () => {
+      const unsynced = allFeedback.filter(f => !f.isSynced);
+      if (unsynced.length > 0 && !isSyncing) {
+        console.log(`Syncing ${unsynced.length} records...`);
+        for (const record of unsynced) {
+          const success = await pushToCloud(record);
+          if (success) {
+            setAllFeedback(prev => 
+              prev.map(f => f.id === record.id ? { ...f, isSynced: true } : f)
+            );
+          }
+        }
+      }
+    }, 30000); // Check every 30 seconds
+
+    return () => clearInterval(syncInterval);
+  }, [allFeedback, isSyncing]);
+
+  // Auto-reset timer for the Thank You screen
+  useEffect(() => {
+    let timeout: number;
+    if (currentStep === Step.THANK_YOU) {
+      timeout = window.setTimeout(() => {
+        resetApp();
+      }, 10000); // 10 seconds
+    }
+    return () => clearTimeout(timeout);
+  }, [currentStep]);
 
   const resetApp = useCallback(() => {
     setCurrentStep(Step.LANDING);
@@ -53,11 +91,27 @@ const App: React.FC = () => {
       voiceAudioBase64: null,
       career: null,
       performanceId: PERFORMANCE_ID,
+      isSynced: false
     });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
-  const updateDatabaseRecord = (updatedRecord: FeedbackData) => {
+  const startNewSession = () => {
+    setData({
+      id: Math.random().toString(36).substr(2, 9),
+      timestamp: Date.now(),
+      emotion: null,
+      memoryRecalled: null,
+      voiceAudioBase64: null,
+      career: null,
+      performanceId: PERFORMANCE_ID,
+      isSynced: false
+    });
+    setCurrentStep(Step.EMOTION);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const updateDatabaseRecord = async (updatedRecord: FeedbackData) => {
     setAllFeedback(prev => {
       const exists = prev.find(f => f.id === updatedRecord.id);
       if (exists) {
@@ -65,10 +119,23 @@ const App: React.FC = () => {
       }
       return [...prev, updatedRecord];
     });
+
+    // Immediate sync attempt
+    if (SYNC_ENDPOINT) {
+      const success = await pushToCloud(updatedRecord);
+      if (success) {
+        setAllFeedback(prev => 
+          prev.map(f => f.id === updatedRecord.id ? { ...f, isSynced: true } : f)
+        );
+      }
+    }
   };
 
   const startRecording = async () => {
     try {
+      // Capture the ID of the session that STARTED the recording
+      const sessionID = data.id;
+      
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const options = { mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4' };
       const recorder = new MediaRecorder(stream, options);
@@ -86,13 +153,54 @@ const App: React.FC = () => {
         reader.readAsDataURL(blob);
         reader.onloadend = async () => {
           const base64 = (reader.result as string).split(',')[1];
-          const currentId = data.id;
-          setData(prev => ({ ...prev, voiceAudioBase64: base64 }));
+          
+          // 1. Optimistic UI update (only affects current screen if ID matches)
+          setData(prev => {
+            if (prev.id === sessionID) {
+               return { ...prev, voiceAudioBase64: base64 };
+            }
+            return prev;
+          });
           
           processVoiceFeedback(base64, recordedMimeType).then(transcription => {
-            setAllFeedback(prev => 
-              prev.map(f => f.id === currentId ? { ...f, aiTranscription: transcription } : f)
-            );
+            // 2. Transcription complete. We must save this to the correct record, 
+            // regardless of whether the user is still on the screen or has finished.
+
+            // A. Update in Persistent List (if user has already finished flow and it was saved)
+            setAllFeedback(prevList => {
+               const index = prevList.findIndex(f => f.id === sessionID);
+               if (index !== -1) {
+                  const newList = [...prevList];
+                  const updatedRecord = { 
+                    ...newList[index], 
+                    voiceAudioBase64: base64, 
+                    aiTranscription: transcription,
+                    isSynced: false // Mark unsynced so it pushes to cloud again
+                  };
+                  newList[index] = updatedRecord;
+                  
+                  // Trigger background sync for this updated record
+                  pushToCloud(updatedRecord).then(success => {
+                    if (success) {
+                      setAllFeedback(currentList => 
+                        currentList.map(item => item.id === sessionID ? { ...item, isSynced: true } : item)
+                      );
+                    }
+                  });
+                  
+                  return newList;
+               }
+               return prevList;
+            });
+
+            // B. Update in Active State (if user is still in the flow)
+            setData(prevData => {
+              if (prevData.id === sessionID) {
+                // We update local state, so when they click 'Career', it saves the transcript
+                return { ...prevData, voiceAudioBase64: base64, aiTranscription: transcription };
+              }
+              return prevData;
+            });
           });
         };
         stream.getTracks().forEach(track => track.stop());
@@ -144,22 +252,24 @@ const App: React.FC = () => {
   };
 
   const handleCareerSelect = (career: string) => {
-    const finalData = { ...data, career };
-    setData(finalData);
-    updateDatabaseRecord(finalData);
+    setData(prev => {
+      const finalData = { ...prev, career };
+      updateDatabaseRecord(finalData);
+      return finalData;
+    });
     setCurrentStep(Step.THANK_YOU);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleHiddenAdminTrigger = () => {
+  const handleHiddenAdminTrigger = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest('button')) return;
     const now = Date.now();
-    if (now - tapRef.current.last < 500) {
+    if (now - tapRef.current.last < 800) {
       tapRef.current.count++;
     } else {
       tapRef.current.count = 1;
     }
     tapRef.current.last = now;
-
     if (tapRef.current.count === 3) {
       setCurrentStep(Step.ADMIN);
       tapRef.current.count = 0;
@@ -167,9 +277,39 @@ const App: React.FC = () => {
     }
   };
 
+  const syncAllFromCloud = async () => {
+    if (!SYNC_ENDPOINT) {
+      alert("No Sync Endpoint configured in constants.tsx");
+      return;
+    }
+    setIsSyncing(true);
+    const cloudData = await pullFromCloud();
+    if (cloudData.length > 0) {
+      setAllFeedback(prev => {
+        const combined = [...prev];
+        cloudData.forEach(cloudRecord => {
+          const exists = combined.findIndex(f => f.id === cloudRecord.id);
+          if (exists === -1) {
+            combined.push({ ...cloudRecord, isSynced: true });
+          } else {
+            combined[exists] = { ...combined[exists], ...cloudRecord, isSynced: true };
+          }
+        });
+        return combined;
+      });
+      alert(`Success! Merged ${cloudData.length} records from the central database.`);
+    } else {
+      alert("No new data found on the cloud.");
+    }
+    setIsSyncing(false);
+  };
+
   const exportToCSV = () => {
-    if (allFeedback.length === 0) return;
-    const headers = ['ID', 'Timestamp', 'Performance', 'Emotion', 'Memory Recalled', 'Career', 'Transcription'];
+    if (allFeedback.length === 0) {
+      alert("No data to export yet.");
+      return;
+    }
+    const headers = ['ID', 'Timestamp', 'Performance', 'Emotion', 'Memory Recalled', 'Career', 'Transcription', 'Synced'];
     const rows = allFeedback.map(f => [
       f.id,
       new Date(f.timestamp).toISOString(),
@@ -177,7 +317,8 @@ const App: React.FC = () => {
       f.emotion,
       f.memoryRecalled ? 'Yes' : 'No',
       f.career,
-      `"${(f.aiTranscription || '').replace(/"/g, '""')}"`
+      `"${(f.aiTranscription || '').replace(/"/g, '""')}"`,
+      f.isSynced ? 'Yes' : 'No'
     ]);
     
     const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
@@ -185,7 +326,7 @@ const App: React.FC = () => {
     const link = document.createElement("a");
     const url = URL.createObjectURL(blob);
     link.setAttribute("href", url);
-    link.setAttribute("download", `performance_feedback_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute("download", `all_feedback_${new Date().toISOString().split('T')[0]}.csv`);
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
@@ -202,7 +343,7 @@ const App: React.FC = () => {
               We'd love to know how the music made you feel.
             </p>
             <button
-              onClick={() => setCurrentStep(Step.EMOTION)}
+              onClick={startNewSession}
               className="bg-indigo-600 hover:bg-indigo-700 text-white text-3xl md:text-5xl font-black py-10 px-20 md:py-12 md:px-28 rounded-[3rem] shadow-2xl active:scale-95 transition-all w-full md:w-auto"
             >
               Start
@@ -328,82 +469,98 @@ const App: React.FC = () => {
       case Step.ADMIN:
         return (
           <div className="w-full flex flex-col pb-20">
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-end mb-10 gap-6">
+            <div className="bg-slate-900 text-white p-8 rounded-[2.5rem] mb-10 shadow-2xl flex flex-col lg:flex-row justify-between items-start lg:items-center gap-8">
               <div>
-                <h2 className="text-4xl font-black text-slate-900 mb-2">Performance Logs</h2>
-                <p className="text-xl text-slate-500 font-bold">Responses: {allFeedback.length} • Memories: {allFeedback.filter(f => f.memoryRecalled).length}</p>
+                <h2 className="text-4xl font-black mb-2">Researcher Dashboard</h2>
+                <div className="flex flex-wrap gap-4 items-center">
+                   <span className="bg-indigo-500 text-white px-3 py-1 rounded-lg text-sm font-bold uppercase tracking-wider">Device ID: {Math.random().toString(36).substr(2, 4)}</span>
+                   <p className="text-xl text-slate-400 font-bold">{allFeedback.length} Total Records</p>
+                </div>
               </div>
+              
               <div className="flex flex-wrap gap-4 w-full lg:w-auto">
                 <button 
-                  onClick={exportToCSV}
-                  className="flex-1 lg:flex-none bg-indigo-50 text-indigo-600 px-6 py-4 rounded-3xl font-black border-4 border-indigo-100 flex items-center justify-center gap-2"
+                  onClick={syncAllFromCloud}
+                  disabled={isSyncing}
+                  className={`${isSyncing ? 'opacity-50' : ''} flex-1 lg:flex-none bg-emerald-600 hover:bg-emerald-500 text-white px-8 py-5 rounded-[1.5rem] font-black shadow-lg flex items-center justify-center gap-3 text-lg transition-all active:scale-95`}
                 >
-                  Download CSV
+                  <svg className={`w-6 h-6 ${isSyncing ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357-2H15"/></svg>
+                  {isSyncing ? 'Syncing...' : 'Pull Cloud Data'}
                 </button>
                 <button 
-                  onClick={() => { if(confirm("Permanently wipe local logs for this device?")) { setAllFeedback([]); localStorage.removeItem(STORAGE_KEY); } }}
-                  className="flex-1 lg:flex-none bg-red-50 text-red-600 px-6 py-4 rounded-3xl font-black border-4 border-red-100"
+                  onClick={exportToCSV}
+                  className="flex-1 lg:flex-none bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-5 rounded-[1.5rem] font-black shadow-lg flex items-center justify-center gap-3 text-lg transition-all active:scale-95"
                 >
-                  Wipe Data
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                  Export CSV
                 </button>
                 <button 
                   onClick={() => setCurrentStep(Step.LANDING)}
-                  className="flex-1 lg:flex-none bg-slate-900 text-white px-8 py-4 rounded-3xl font-black shadow-lg"
+                  className="bg-white text-slate-900 px-8 py-5 rounded-[1.5rem] font-black shadow-lg transition-all active:scale-95"
                 >
-                  Exit Admin
+                  Exit
                 </button>
               </div>
             </div>
             
-            <div className="bg-white border-4 border-slate-200 rounded-[2.5rem] shadow-xl overflow-x-auto">
-              <table className="w-full border-collapse min-w-[900px]">
-                <thead className="bg-slate-900 text-white">
-                  <tr>
-                    <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Time</th>
-                    <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Emotion</th>
-                    <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Memory</th>
-                    <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Career</th>
-                    <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Transcription</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {allFeedback.length === 0 ? (
-                    <tr><td colSpan={5} className="p-24 text-center text-2xl font-bold text-slate-300 italic">No responses recorded</td></tr>
-                  ) : (
-                    [...allFeedback].reverse().map((f) => (
-                      <tr key={f.id} className="hover:bg-indigo-50/50 transition-colors">
-                        <td className="p-6 align-top">
-                          <p className="font-bold text-slate-900 text-sm">{new Date(f.timestamp).toLocaleDateString()}</p>
-                          <p className="text-[10px] text-slate-400 font-mono">{new Date(f.timestamp).toLocaleTimeString()}</p>
-                        </td>
-                        <td className="p-6 align-top text-3xl">
-                           {EMOTIONS.find(e => e.label === f.emotion)?.icon}
-                           <span className="text-sm font-bold block mt-1 text-slate-400 uppercase">{f.emotion}</span>
-                        </td>
-                        <td className="p-6 align-top">
-                          <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest ${f.memoryRecalled ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>
-                            {f.memoryRecalled ? 'YES' : 'NO'}
-                          </span>
-                        </td>
-                        <td className="p-6 align-top font-bold text-slate-700 text-sm">{f.career}</td>
-                        <td className="p-6 align-top">
-                          <div className="text-sm text-slate-600 leading-relaxed italic bg-slate-50 p-4 rounded-xl border border-slate-100 min-h-[50px]">
-                            {f.aiTranscription ? (
-                              `"${f.aiTranscription}"`
-                            ) : (
-                              f.memoryRecalled && f.voiceAudioBase64 ? (
-                                <span className="flex items-center gap-2 text-indigo-400 animate-pulse font-black text-xs uppercase">
-                                  Transcribing...
-                                </span>
-                               ) : <span className="text-slate-200">None</span>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+            <div className="bg-white border-4 border-slate-200 rounded-[2.5rem] shadow-xl overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse min-w-[900px]">
+                  <thead className="bg-slate-100 text-slate-500 border-b-4 border-slate-200">
+                    <tr>
+                      <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Time / Status</th>
+                      <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Emotion</th>
+                      <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Memory</th>
+                      <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Career</th>
+                      <th className="p-6 text-left text-xs font-black uppercase tracking-widest">Transcription</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {allFeedback.length === 0 ? (
+                      <tr><td colSpan={5} className="p-24 text-center text-2xl font-bold text-slate-300 italic">No responses recorded yet.</td></tr>
+                    ) : (
+                      [...allFeedback].sort((a,b) => b.timestamp - a.timestamp).map((f) => (
+                        <tr key={f.id} className="hover:bg-indigo-50/50 transition-colors">
+                          <td className="p-6 align-top">
+                            <p className="font-bold text-slate-900 text-sm">{new Date(f.timestamp).toLocaleDateString()}</p>
+                            <p className="text-[10px] text-slate-400 font-mono mb-2">{new Date(f.timestamp).toLocaleTimeString()}</p>
+                            <span className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[9px] font-black uppercase ${f.isSynced ? 'bg-emerald-50 text-emerald-600' : 'bg-orange-50 text-orange-600'}`}>
+                              {f.isSynced ? (
+                                <><svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M5.5 13a3.5 3.5 0 01-.369-6.98 4 4 0 117.753-1.977A4.5 4.5 0 1113.5 13H5.5z"/></svg> Cloud Synced</>
+                              ) : (
+                                <><svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293A1 1 0 016 6h8a1 1 0 110 2H6a1 1 0 01-.707-.293zM5 10a1 1 0 011-1h8a1 1 0 110 2H6a1 1 0 01-1-1zm0 4a1 1 0 011-1h4a1 1 0 110 2H6a1 1 0 01-1-1z" clipRule="evenodd"/></svg> Local Only</>
+                              )}
+                            </span>
+                          </td>
+                          <td className="p-6 align-top text-3xl">
+                             {EMOTIONS.find(e => e.label === f.emotion)?.icon}
+                             <span className="text-[10px] font-black block mt-1 text-slate-400 uppercase">{f.emotion}</span>
+                          </td>
+                          <td className="p-6 align-top">
+                            <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest ${f.memoryRecalled ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>
+                              {f.memoryRecalled ? 'YES' : 'NO'}
+                            </span>
+                          </td>
+                          <td className="p-6 align-top font-bold text-slate-700 text-sm">{f.career}</td>
+                          <td className="p-6 align-top">
+                            <div className="text-sm text-slate-600 leading-relaxed italic bg-slate-50 p-4 rounded-xl border border-slate-100 min-h-[50px]">
+                              {f.aiTranscription ? (
+                                `"${f.aiTranscription}"`
+                              ) : (
+                                f.memoryRecalled && f.voiceAudioBase64 ? (
+                                  <span className="flex items-center gap-2 text-indigo-400 animate-pulse font-black text-xs uppercase">
+                                    Transcribing...
+                                  </span>
+                                 ) : <span className="text-slate-200">None</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         );
@@ -414,7 +571,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div onClick={handleHiddenAdminTrigger} className="min-h-screen w-full bg-slate-50">
+    <div onClick={handleHiddenAdminTrigger} className="min-h-screen w-full bg-slate-50 overflow-y-auto">
       <Layout stepName={currentStep === Step.ADMIN ? 'RESEARCHER DASHBOARD' : currentStep.replace('_', ' ')}>
         {renderStep()}
       </Layout>

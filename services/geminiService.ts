@@ -1,14 +1,16 @@
 
 import { GoogleGenAI } from "@google/genai";
 
+/**
+ * Processes audio feedback using Gemini to generate a transcription.
+ * Designed to be highly conservative to prevent hallucinations in noisy environments.
+ */
 export const processVoiceFeedback = async (base64Audio: string, mimeType: string) => {
   if (!base64Audio) return null;
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
-    // We use gemini-3-flash-preview for multimodal content generation (audio to text)
-    // The previous native-audio model is specific to the Live API session.
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: {
@@ -20,14 +22,33 @@ export const processVoiceFeedback = async (base64Audio: string, mimeType: string
             },
           },
           {
-            text: "You are an expert transcriber. Listen to this audio recording from a senior citizen sharing a memory about music. Transcribe exactly what they say. Do not add any conversational filler from yourself or any interpretation. If there is no talking or the audio is silent, return only: [No speech detected]."
+            text: `TASK: Transcribe the audio provided.
+CONTEXT: This is a short voice recording from a senior citizen sharing a memory after a music performance. The environment might have background noise.
+
+STRICT RULES:
+1. Transcribe EXACTLY what is spoken.
+2. If the audio contains only background noise, breathing, or silence, return ONLY: "[No speech detected]".
+3. DO NOT "guess" or "hallucinate" words if the audio is unclear. Use "[Inaudible]" for specific unclear segments.
+4. DO NOT add any descriptions like (clears throat) or [Music playing].
+5. DO NOT provide any summaries or interpretations.
+6. If you are not at least 80% confident that actual speech is present, return: "[No speech detected]".`
           }
         ]
       },
+      config: {
+        // Temperature 0 makes the model more deterministic and less likely to "creatively" fill in gaps
+        temperature: 0,
+        topP: 0.1,
+        topK: 1
+      }
     });
 
-    const text = response.text;
-    return text || "[Empty transcription]";
+    const text = response.text?.trim();
+    
+    // Safety check for empty or whitespace-only returns
+    if (!text || text.length === 0) return "[No speech detected]";
+    
+    return text;
   } catch (error) {
     console.error("Gemini Transcription Error:", error);
     return `[Transcription error: ${error instanceof Error ? error.message : 'Unknown'}]`;

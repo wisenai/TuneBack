@@ -3,6 +3,13 @@ import { EmotionOption, CareerOption } from './types';
 
 export const PERFORMANCE_ID = "GardenTerrace_2025-12-27";
 
+/**
+ * CENTRAL SYNC ENDPOINT
+ * Point this to a Google Apps Script Web App URL or a Firebase Function
+ * to enable cross-device data centralization.
+ */
+export const SYNC_ENDPOINT = ""; // e.g., "https://script.google.com/macros/s/.../exec"
+
 export const EMOTIONS: EmotionOption[] = [
   { label: 'Happy', icon: '😊', color: 'bg-yellow-100 hover:bg-yellow-200 border-yellow-300' },
   { label: 'Calm', icon: '😌', color: 'bg-blue-100 hover:bg-blue-200 border-blue-300' },
