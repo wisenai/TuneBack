@@ -1,0 +1,7 @@
+{
+  "name": "Senior Music Feedback App",
+  "description": "A high-accessibility web application for collecting emotional and memory-related feedback from seniors after music performances.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
