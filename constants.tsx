@@ -4,11 +4,22 @@ import { EmotionOption, CareerOption } from './types';
 export const PERFORMANCE_ID = "GardenTerrace_2025-12-27";
 
 /**
- * CENTRAL SYNC ENDPOINT
- * Point this to a Google Apps Script Web App URL or a Firebase Function
- * to enable cross-device data centralization.
+ * FIREBASE CONFIGURATION
  */
-export const SYNC_ENDPOINT = ""; // e.g., "https://script.google.com/macros/s/.../exec"
+export const FIREBASE_CONFIG = {
+  apiKey: "REPLACE_WITH_YOUR_KEY",
+  authDomain: "music-study-feedback.firebaseapp.com",
+  projectId: "music-study-feedback",
+  storageBucket: "music-study-feedback.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:abcdef123456"
+};
+
+/**
+ * GOOGLE SHEETS / APPS SCRIPT ENDPOINT
+ * Paste your Apps Script Web App URL here for easy spreadsheet data collection.
+ */
+export const GOOGLE_SHEETS_URL = ""; 
 
 export const EMOTIONS: EmotionOption[] = [
   { label: 'Happy', icon: '😊', color: 'bg-yellow-100 hover:bg-yellow-200 border-yellow-300' },
