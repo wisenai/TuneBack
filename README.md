@@ -9,7 +9,7 @@ I performed Granados.
 
 Here This! -> https://www.youtube.com/watch?v=0IGwbbbqBIE
 
-AI Studio was easy to create an app with and the voice capablities are so good. Truly impressed.
+Google AI Studio was easy to create an app with and the voice capablities are so good. Truly impressed.
 
 # Run and deploy your AI Studio app
 
